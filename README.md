@@ -2,7 +2,7 @@
 
 ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue.svg)
 ![Language: C++](https://img.shields.io/badge/Language-C++-f34b7d.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![License: GNU](https://img.shields.io/badge/License-GNU-blue.svg)
 
 **WinKeyHook** is a lightweight, low-level global keyboard hooking daemon for Windows. It allows multiple applications or scripts to register and listen for complex global hotkeys (combinations of keys) simultaneously without conflicting with each other.
 
