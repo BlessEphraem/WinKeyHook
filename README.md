@@ -15,7 +15,7 @@ It provides two distinct modes of operation:
 ## Features
 
 - **Global Hotkey Interception:** Captures key presses system-wide using `SetWindowsHookEx(WH_KEYBOARD_LL)`.
-- **Mouse Button Awareness:** Installs a `WH_MOUSE_LL` hook so that mouse clicks properly cancel pending modifier-only combos (enables `Win+MButton` shortcuts in AutoHotkey and similar tools).
+- **Mouse Button Awareness:** Installs a `WH_MOUSE_LL` hook so that mouse clicks properly cancel pending modifier-only combos (enables `Win+MButton` shortcuts in AutoHotkey and similar tools). A `GetAsyncKeyState` fallback also covers keyboard and mouse combos swallowed by tools that break the hook chain.
 - **Complex Combos:** Supports multi-key combinations (e.g., `LCTRL+LSHIFT+A`).
 - **Singleton Architecture:** Ensures only one instance of the daemon runs at a time (using a global mutex), centralizing all hotkey management to save system resources.
 - **IPC Named Pipe:** Fast and reliable communication (`\\.\pipe\WinKeyHook`) for third-party apps to interact with the daemon.
@@ -141,10 +141,10 @@ When a registered combo contains **only modifier keys** (e.g., `LWIN` alone, or 
 
 This prevents the daemon from firing your shortcut when the user actually intends to press `Win+S`, `Win+Shift+S`, or any other system combo that begins with the same modifier. The sequence works as follows:
 
-1. **Key-down:** The modifier is silently suppressed (not passed to Windows).
-2. **Any other key pressed while modifier is held:** The modifier is injected back immediately and the pending trigger is cancelled — the system shortcut (e.g. `Win+S`) fires normally.
-3. **Mouse button clicked while modifier is held:** Same cancellation as above — the mouse shortcut (e.g. an AutoHotkey `Win+MButton` binding) fires normally.
-4. **Key-up with no other key pressed:** The combo triggers (`TRIGGERED`).
+1. **Key-down:** The modifier passes through to Windows normally. Windows and AHK see the physical key press.
+2. **Any other key pressed while modifier is held:** The pending trigger is cancelled — Windows and AHK already see the modifier held, so the system shortcut (e.g. `Win+S`) fires normally without any injection needed.
+3. **Mouse button clicked while modifier is held:** Same cancellation — the mouse shortcut (e.g. an AutoHotkey `Win+MButton` binding) fires normally. A `WH_MOUSE_LL` hook handles this; a `GetAsyncKeyState` fallback covers cases where another tool breaks the hook chain.
+4. **Key-up with no other key pressed:** The combo triggers (`TRIGGERED`). The physical keyup is suppressed, and a synthetic Ctrl tap + modifier keyup is injected to release the stuck modifier state and prevent the Start Menu.
 
 **Examples:**
 

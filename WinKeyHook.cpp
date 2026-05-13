@@ -271,17 +271,89 @@ static void FireCombo(const Combo& combo, std::vector<PendingWrite>& pw) {
     }
 }
 
-// ---------- Modifier injection helper ------------------------------------------
-// Sends synthetic keydown events for suppressed modifiers so system shortcuts
-// (Win+S, Win+Shift+S, etc.) still reach Windows after a pending combo is cancelled.
-static void InjectModifiers(const std::vector<DWORD>& vks) {
-    for (DWORD vk : vks) {
-        INPUT inp      = {};
-        inp.type       = INPUT_KEYBOARD;
-        inp.ki.wVk     = (WORD)vk;
-        inp.ki.dwFlags = (vk == VK_LWIN || vk == VK_RWIN) ? KEYEVENTF_EXTENDEDKEY : 0;
-        SendInput(1, &inp, sizeof(INPUT));
-    }
+// ---------- Modifier cleanup helper -------------------------------------------
+// ---------- GetAsyncKeyState helpers for modifier-only combos -----------------
+// When another tool (e.g. AHK) handles a hotkey without calling CallNextHookEx,
+// our hook never sees the second key. These helpers use the "since-last-call"
+// history bit (bit 0) of GetAsyncKeyState to detect missed presses.
+// Call ClearInputHistory() when pending_trigger becomes true, then call
+// AnyNonModifierKeyPressedSince() at keyup to decide whether to cancel.
+static void ClearInputHistory() {
+    GetAsyncKeyState(VK_LBUTTON); GetAsyncKeyState(VK_RBUTTON);
+    GetAsyncKeyState(VK_MBUTTON); GetAsyncKeyState(VK_XBUTTON1);
+    GetAsyncKeyState(VK_XBUTTON2);
+    for (int vk = 'A'; vk <= 'Z';        vk++) GetAsyncKeyState(vk);
+    for (int vk = '0'; vk <= '9';        vk++) GetAsyncKeyState(vk);
+    for (int vk = VK_F1; vk <= VK_F24;   vk++) GetAsyncKeyState(vk);
+    for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; vk++) GetAsyncKeyState(vk);
+    GetAsyncKeyState(VK_SPACE);    GetAsyncKeyState(VK_TAB);
+    GetAsyncKeyState(VK_RETURN);   GetAsyncKeyState(VK_ESCAPE);
+    GetAsyncKeyState(VK_BACK);     GetAsyncKeyState(VK_DELETE);
+    GetAsyncKeyState(VK_INSERT);   GetAsyncKeyState(VK_HOME);
+    GetAsyncKeyState(VK_END);      GetAsyncKeyState(VK_PRIOR);
+    GetAsyncKeyState(VK_NEXT);     GetAsyncKeyState(VK_UP);
+    GetAsyncKeyState(VK_DOWN);     GetAsyncKeyState(VK_LEFT);
+    GetAsyncKeyState(VK_RIGHT);    GetAsyncKeyState(VK_APPS);
+    GetAsyncKeyState(VK_SNAPSHOT); GetAsyncKeyState(VK_SCROLL);
+    GetAsyncKeyState(VK_PAUSE);    GetAsyncKeyState(VK_CAPITAL);
+    GetAsyncKeyState(VK_NUMLOCK);
+}
+static bool AnyNonModifierKeyPressedSince() {
+    bool r = false;
+    r |= (GetAsyncKeyState(VK_LBUTTON)  & 1) != 0;
+    r |= (GetAsyncKeyState(VK_RBUTTON)  & 1) != 0;
+    r |= (GetAsyncKeyState(VK_MBUTTON)  & 1) != 0;
+    r |= (GetAsyncKeyState(VK_XBUTTON1) & 1) != 0;
+    r |= (GetAsyncKeyState(VK_XBUTTON2) & 1) != 0;
+    for (int vk = 'A'; vk <= 'Z';        vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
+    for (int vk = '0'; vk <= '9';        vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
+    for (int vk = VK_F1; vk <= VK_F24;   vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
+    for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
+    r |= (GetAsyncKeyState(VK_SPACE)    & 1) != 0;
+    r |= (GetAsyncKeyState(VK_TAB)      & 1) != 0;
+    r |= (GetAsyncKeyState(VK_RETURN)   & 1) != 0;
+    r |= (GetAsyncKeyState(VK_ESCAPE)   & 1) != 0;
+    r |= (GetAsyncKeyState(VK_BACK)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_DELETE)   & 1) != 0;
+    r |= (GetAsyncKeyState(VK_INSERT)   & 1) != 0;
+    r |= (GetAsyncKeyState(VK_HOME)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_END)      & 1) != 0;
+    r |= (GetAsyncKeyState(VK_PRIOR)    & 1) != 0;
+    r |= (GetAsyncKeyState(VK_NEXT)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_UP)       & 1) != 0;
+    r |= (GetAsyncKeyState(VK_DOWN)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_LEFT)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_RIGHT)    & 1) != 0;
+    r |= (GetAsyncKeyState(VK_APPS)     & 1) != 0;
+    r |= (GetAsyncKeyState(VK_SNAPSHOT) & 1) != 0;
+    r |= (GetAsyncKeyState(VK_SCROLL)   & 1) != 0;
+    r |= (GetAsyncKeyState(VK_PAUSE)    & 1) != 0;
+    r |= (GetAsyncKeyState(VK_CAPITAL)  & 1) != 0;
+    r |= (GetAsyncKeyState(VK_NUMLOCK)  & 1) != 0;
+    return r;
+}
+
+// Called when a modifier-only combo fires on keyup (solo press).
+// We suppressed the physical keyup -- inject a Ctrl tap to "poison" the modifier
+// press (prevents Start Menu / Ctrl+Alt+Del prompt), then inject the modifier keyup
+// to release Windows's stuck modifier state. Both events carry LLKHF_INJECTED so
+// our hook skips them; AHK ignores injected events for hotkey triggering by default.
+static void InjectModifierCleanup(DWORD modVk) {
+    INPUT inputs[3] = {};
+    // Ctrl down (poison -- tells Windows another key was pressed while mod held)
+    inputs[0].type       = INPUT_KEYBOARD;
+    inputs[0].ki.wVk     = VK_LCONTROL;
+    inputs[0].ki.dwFlags = 0;
+    // Ctrl up
+    inputs[1].type       = INPUT_KEYBOARD;
+    inputs[1].ki.wVk     = VK_LCONTROL;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    // Modifier keyup
+    inputs[2].type       = INPUT_KEYBOARD;
+    inputs[2].ki.wVk     = (WORD)modVk;
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP |
+                           ((modVk == VK_LWIN || modVk == VK_RWIN) ? KEYEVENTF_EXTENDEDKEY : 0);
+    SendInput(3, inputs, sizeof(INPUT));
 }
 
 // ---------- Watchdog thread ----------------------------------------------------
@@ -468,8 +540,9 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event,
 }
 
 // ---------- Low-level mouse hook -----------------------------------------------
-// Cancels any pending modifier-only combo when the user clicks a mouse button,
-// injecting the suppressed modifier back so Win+MButton AHK shortcuts work.
+// Cancels any pending modifier-only combo when the user clicks a mouse button.
+// The modifier was never suppressed (passes through on keydown), so AHK already
+// sees it held -- no injection needed; Win+MButton AHK shortcuts work natively.
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_mouse_hook, nCode, wParam, lParam);
@@ -478,25 +551,15 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                          wParam == WM_MBUTTONDOWN  || wParam == WM_XBUTTONDOWN);
 
     if (isButtonDown) {
-        std::vector<DWORD> to_inject;
-
         EnterCriticalSection(&g_cs);
         for (auto& combo : g_combos) {
             if (combo.pending_trigger) {
                 combo.had_other_key   = true;
                 combo.pending_trigger = false;
                 combo.active          = false;
-                for (const auto& s : combo.slots)
-                    for (DWORD vk : s.vks)
-                        if (g_suppressed.count(vk)) {
-                            g_suppressed.erase(vk);
-                            to_inject.push_back(vk);
-                        }
             }
         }
         LeaveCriticalSection(&g_cs);
-
-        InjectModifiers(to_inject);
     }
 
     return CallNextHookEx(g_mouse_hook, nCode, wParam, lParam);
@@ -525,32 +588,24 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             bool suppress = false;
 
             // Phase 1: cancel any pending modifier-only combo interrupted by a non-combo key.
-            // Collect injections to perform outside the CS.
+            // The modifier was passed through on keydown (not suppressed), so no injection
+            // is needed -- AHK already sees the modifier held, and the new key passes normally.
             {
-                std::vector<DWORD> to_inject;
-
                 EnterCriticalSection(&g_cs);
                 for (auto& combo : g_combos) {
                     if (combo.pending_trigger && !combo.hasVk(p->vkCode)) {
                         combo.had_other_key   = true;
                         combo.pending_trigger = false;
                         combo.active          = false;
-                        for (const auto& s : combo.slots)
-                            for (DWORD vk : s.vks)
-                                if (g_suppressed.count(vk)) {
-                                    g_suppressed.erase(vk);
-                                    to_inject.push_back(vk);
-                                }
                     }
                 }
                 LeaveCriticalSection(&g_cs);
-
-                InjectModifiers(to_inject);
             }
 
             // Phase 2: check for newly satisfied combos.
             // Only evaluate a combo when the pressed key belongs to it -- prevents
             // re-firing cancelled modifier-only combos when unrelated keys come in.
+            bool pending_modifier_set = false;
             std::vector<PendingWrite> pw;
             EnterCriticalSection(&g_cs);
             for (auto& combo : g_combos) {
@@ -563,10 +618,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     }
 
                     if (combo.isModifierOnly()) {
-                        // Wait for key-up before triggering so Win+X combos can still work
+                        // Pass modifier through so AHK sees a physical keydown.
+                        // Fire on keyup instead (suppress keyup + inject cleanup there).
                         combo.pending_trigger = true;
                         combo.had_other_key   = false;
-                        suppress = true;
+                        pending_modifier_set   = true;
+                        // suppress stays false -- key passes to Windows/AHK normally
                     } else {
                         combo.active = true;
                         suppress = true;
@@ -577,6 +634,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             LeaveCriticalSection(&g_cs);
 
             FlushPendingWrites(pw);  // WriteFile outside CS
+
+            if (pending_modifier_set)
+                ClearInputHistory();
 
             if (suppress) {
                 g_suppressed.insert(p->vkCode);
@@ -591,14 +651,29 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (keyUp) {
         g_pressed.erase(p->vkCode);
 
+        // Fallback: detect keys/clicks AHK may have swallowed without calling CallNextHookEx.
+        // AnyNonModifierKeyPressedSince() consumes all history bits (no bleed into next window).
+        bool input_fallback = AnyNonModifierKeyPressedSince();
+
+        DWORD cleanup_vk = 0;
         std::vector<PendingWrite> pw;
         EnterCriticalSection(&g_cs);
         for (auto& combo : g_combos) {
             if (combo.pending_trigger && combo.hasVk(p->vkCode)) {
                 combo.pending_trigger = false;
                 combo.active          = false;
-                if (!combo.had_other_key)
-                    FireCombo(combo, pw);
+                if (!combo.had_other_key) {
+                    if (input_fallback) {
+                        combo.had_other_key = true;
+                        Logf("CANCEL '%s': key/click detected via GetAsyncKeyState fallback",
+                             combo.identifier().c_str());
+                    } else {
+                        // Solo modifier press: suppress keyup to prevent Start Menu,
+                        // then inject cleanup sequence to release Windows modifier state.
+                        cleanup_vk = p->vkCode;
+                        FireCombo(combo, pw);
+                    }
+                }
             }
             if (combo.active && !combo.satisfied(g_pressed))
                 combo.active = false;
@@ -606,6 +681,11 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         LeaveCriticalSection(&g_cs);
 
         FlushPendingWrites(pw);  // WriteFile outside CS
+
+        if (cleanup_vk != 0) {
+            InjectModifierCleanup(cleanup_vk);
+            return 1;  // suppress physical keyup
+        }
 
         if (g_suppressed.count(p->vkCode)) {
             g_suppressed.erase(p->vkCode);
@@ -713,7 +793,7 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "--version") {
-            std::cout << "v1.0.0" << std::endl;
+            std::cout << "v1.0.1" << std::endl;
             return 0;
         }
     }
