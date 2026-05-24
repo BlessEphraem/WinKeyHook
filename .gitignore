@@ -2,3 +2,7 @@
 *.obj
 *.pdb
 *.ilk
+
+/releases*
+/.claude
+Publish_Release.py

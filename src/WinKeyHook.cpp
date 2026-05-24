@@ -9,8 +9,12 @@
 #include <set>
 #include <algorithm>
 #include <atomic>
+#include <tuple>
 #include <cstdarg>
 #include <conio.h>
+#include <winhttp.h>
+#include <shellapi.h>
+#include <urlmon.h>
 
 // Protocol (pipe, text, \n-terminated):
 //   CLIENT->SERVER:  REGISTER <spec> [<name>]
@@ -25,9 +29,10 @@
 // Stdout (CLI combos):  HOOK_STARTED | ALREADY_RUNNING
 //                       TRIGGERED:<idx> [<name>]
 
-static const wchar_t* PIPE_NAME  = L"\\\\.\\pipe\\WinKeyHook";
-static const wchar_t* MUTEX_NAME = L"Global\\WinKeyHookSingleton";
-static const DWORD    PIPE_BUF   = 4096;
+static const char*    WINKEYHOOK_VERSION = "v1.1.0";
+static const wchar_t* PIPE_NAME          = L"\\\\.\\pipe\\WinKeyHook";
+static const wchar_t* MUTEX_NAME         = L"Global\\WinKeyHookSingleton";
+static const DWORD    PIPE_BUF           = 4096;
 
 static const DWORD MODIFIER_VKS[] = {
     VK_LSHIFT, VK_RSHIFT,
@@ -125,11 +130,16 @@ struct Client {
 HHOOK          g_hook           = NULL;
 HHOOK          g_mouse_hook     = NULL;
 HWINEVENTHOOK  g_win_event_hook = NULL;
+HWINEVENTHOOK  g_fg_event_hook  = NULL;   // EVENT_SYSTEM_FOREGROUND hook
+HWND           g_msg_wnd        = NULL;   // message-only window for raw input
 DWORD          g_main_thread_id = 0;
 
 CRITICAL_SECTION     g_cs;         // guards g_combos + g_clients
 std::vector<Combo>   g_combos;
 std::vector<Client>  g_clients;
+
+static HWND g_pending_foreground  = NULL;   // foreground at LWin keydown; NULL when no pending combo
+static bool g_pending_fg_changed  = false;  // true if foreground changed at least once while pending
 
 std::set<DWORD>   g_pressed;    // hook-thread only -> no lock needed
 std::set<DWORD>   g_suppressed;
@@ -196,6 +206,21 @@ static std::vector<DWORD> ParseKeyName(const std::string& raw) {
 
     if (n.size() >= 3 && n[0] == '0' && n[1] == 'X') {
         try { return {(DWORD)std::stoul(n, nullptr, 16)}; } catch (...) {}
+    }
+
+    // Unicode fallback: resolve via active keyboard layout (AZERTY, Dvorak, etc.)
+    // Only reached when no hardcoded name matched — zero impact on existing combos.
+    {
+        wchar_t wch[4] = {};
+        int count = MultiByteToWideChar(CP_UTF8, 0, raw.c_str(), (int)raw.size(), wch, 3);
+        if (count == 1 && wch[0] != 0) {
+            HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+            SHORT scan = VkKeyScanExW(wch[0], hkl);
+            if (scan != -1 && LOBYTE(scan) != 0) {
+                Logf("ParseKeyName: '%s' -> VK=0x%02X via VkKeyScanEx", raw.c_str(), LOBYTE(scan));
+                return {(DWORD)(BYTE)LOBYTE(scan)};
+            }
+        }
     }
 
     return {};
@@ -271,68 +296,211 @@ static void FireCombo(const Combo& combo, std::vector<PendingWrite>& pw) {
     }
 }
 
-// ---------- Modifier cleanup helper -------------------------------------------
-// ---------- GetAsyncKeyState helpers for modifier-only combos -----------------
-// When another tool (e.g. AHK) handles a hotkey without calling CallNextHookEx,
-// our hook never sees the second key. These helpers use the "since-last-call"
-// history bit (bit 0) of GetAsyncKeyState to detect missed presses.
-// Call ClearInputHistory() when pending_trigger becomes true, then call
-// AnyNonModifierKeyPressedSince() at keyup to decide whether to cancel.
-static void ClearInputHistory() {
-    GetAsyncKeyState(VK_LBUTTON); GetAsyncKeyState(VK_RBUTTON);
-    GetAsyncKeyState(VK_MBUTTON); GetAsyncKeyState(VK_XBUTTON1);
-    GetAsyncKeyState(VK_XBUTTON2);
-    for (int vk = 'A'; vk <= 'Z';        vk++) GetAsyncKeyState(vk);
-    for (int vk = '0'; vk <= '9';        vk++) GetAsyncKeyState(vk);
-    for (int vk = VK_F1; vk <= VK_F24;   vk++) GetAsyncKeyState(vk);
-    for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; vk++) GetAsyncKeyState(vk);
-    GetAsyncKeyState(VK_SPACE);    GetAsyncKeyState(VK_TAB);
-    GetAsyncKeyState(VK_RETURN);   GetAsyncKeyState(VK_ESCAPE);
-    GetAsyncKeyState(VK_BACK);     GetAsyncKeyState(VK_DELETE);
-    GetAsyncKeyState(VK_INSERT);   GetAsyncKeyState(VK_HOME);
-    GetAsyncKeyState(VK_END);      GetAsyncKeyState(VK_PRIOR);
-    GetAsyncKeyState(VK_NEXT);     GetAsyncKeyState(VK_UP);
-    GetAsyncKeyState(VK_DOWN);     GetAsyncKeyState(VK_LEFT);
-    GetAsyncKeyState(VK_RIGHT);    GetAsyncKeyState(VK_APPS);
-    GetAsyncKeyState(VK_SNAPSHOT); GetAsyncKeyState(VK_SCROLL);
-    GetAsyncKeyState(VK_PAUSE);    GetAsyncKeyState(VK_CAPITAL);
-    GetAsyncKeyState(VK_NUMLOCK);
-}
-static bool AnyNonModifierKeyPressedSince() {
-    bool r = false;
-    r |= (GetAsyncKeyState(VK_LBUTTON)  & 1) != 0;
-    r |= (GetAsyncKeyState(VK_RBUTTON)  & 1) != 0;
-    r |= (GetAsyncKeyState(VK_MBUTTON)  & 1) != 0;
-    r |= (GetAsyncKeyState(VK_XBUTTON1) & 1) != 0;
-    r |= (GetAsyncKeyState(VK_XBUTTON2) & 1) != 0;
-    for (int vk = 'A'; vk <= 'Z';        vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
-    for (int vk = '0'; vk <= '9';        vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
-    for (int vk = VK_F1; vk <= VK_F24;   vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
-    for (int vk = VK_NUMPAD0; vk <= VK_NUMPAD9; vk++) r |= (GetAsyncKeyState(vk) & 1) != 0;
-    r |= (GetAsyncKeyState(VK_SPACE)    & 1) != 0;
-    r |= (GetAsyncKeyState(VK_TAB)      & 1) != 0;
-    r |= (GetAsyncKeyState(VK_RETURN)   & 1) != 0;
-    r |= (GetAsyncKeyState(VK_ESCAPE)   & 1) != 0;
-    r |= (GetAsyncKeyState(VK_BACK)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_DELETE)   & 1) != 0;
-    r |= (GetAsyncKeyState(VK_INSERT)   & 1) != 0;
-    r |= (GetAsyncKeyState(VK_HOME)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_END)      & 1) != 0;
-    r |= (GetAsyncKeyState(VK_PRIOR)    & 1) != 0;
-    r |= (GetAsyncKeyState(VK_NEXT)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_UP)       & 1) != 0;
-    r |= (GetAsyncKeyState(VK_DOWN)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_LEFT)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_RIGHT)    & 1) != 0;
-    r |= (GetAsyncKeyState(VK_APPS)     & 1) != 0;
-    r |= (GetAsyncKeyState(VK_SNAPSHOT) & 1) != 0;
-    r |= (GetAsyncKeyState(VK_SCROLL)   & 1) != 0;
-    r |= (GetAsyncKeyState(VK_PAUSE)    & 1) != 0;
-    r |= (GetAsyncKeyState(VK_CAPITAL)  & 1) != 0;
-    r |= (GetAsyncKeyState(VK_NUMLOCK)  & 1) != 0;
-    return r;
+// ---------- Pending-combo cancellation helper ----------------------------------
+// Cancels all pending modifier-only combos. Called under g_cs.
+static void CancelPendingCombos(const char* reason) {
+    bool any = false;
+    for (auto& c : g_combos) if (c.pending_trigger) { any = true; break; }
+    if (any) {
+        for (auto& c : g_combos)
+            if (c.pending_trigger) {
+                c.had_other_key   = true;
+                c.pending_trigger = false;
+                c.active          = false;
+            }
+        Logf("CANCEL pending combos: %s", reason);
+        // Reset FG tracking so stale events don't affect the next combo.
+        // Without this, if the cancel came from MsgWndProc (hasPending=false at keyup),
+        // the keyup FG-reset block is skipped and g_pending_foreground stays set,
+        // causing spurious FG_CHANGED cancels on subsequent solo presses.
+        g_pending_foreground = NULL;
+        g_pending_fg_changed = false;
+    }
 }
 
+// ---------- Driver-level key history (GetAsyncKeyState bit 0) -----------------
+// GetAsyncKeyState() bit 0 is set if the key was pressed since the last call
+// for that key.  This is recorded at the HID driver level — BELOW the LL hook
+// chain, BELOW AHK, and BELOW Windows Shell (which processes Win+1–9 before
+// any hook fires).  Reading the bit clears it for subsequent calls.
+//
+// ClearInputHistory: called when pending_trigger is set (modifier keydown) so
+// that AnyNonModifierKeyPressedSince() only detects keys pressed AFTER that
+// moment.
+//
+// AnyNonModifierKeyPressedSince: final fallback at modifier keyup, after
+// DrainRawInput and the foreground check.  Catches Win+1 when the target app
+// is already in the foreground (no foreground change) and the '1' key was
+// consumed by Windows Shell before reaching raw input or the LL hook chain.
+
+static const DWORD NON_MODIFIER_VKS[] = {
+    'A','B','C','D','E','F','G','H','I','J','K','L','M',
+    'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    '0','1','2','3','4','5','6','7','8','9',
+    VK_F1,VK_F2,VK_F3,VK_F4,VK_F5,VK_F6,
+    VK_F7,VK_F8,VK_F9,VK_F10,VK_F11,VK_F12,
+    VK_F13,VK_F14,VK_F15,VK_F16,VK_F17,VK_F18,
+    VK_F19,VK_F20,VK_F21,VK_F22,VK_F23,VK_F24,
+    VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
+    VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
+    VK_MULTIPLY,VK_ADD,VK_SUBTRACT,VK_DECIMAL,VK_DIVIDE,
+    VK_SPACE,VK_TAB,VK_RETURN,VK_ESCAPE,VK_BACK,
+    VK_DELETE,VK_INSERT,VK_HOME,VK_END,VK_PRIOR,VK_NEXT,
+    VK_UP,VK_DOWN,VK_LEFT,VK_RIGHT,
+    VK_OEM_1,VK_OEM_PLUS,VK_OEM_COMMA,VK_OEM_MINUS,
+    VK_OEM_PERIOD,VK_OEM_2,VK_OEM_3,VK_OEM_4,VK_OEM_5,
+    VK_OEM_6,VK_OEM_7,VK_OEM_8,
+    VK_LBUTTON,VK_RBUTTON,VK_MBUTTON,VK_XBUTTON1,VK_XBUTTON2,
+};
+
+static void ClearInputHistory() {
+    for (DWORD vk : NON_MODIFIER_VKS)
+        GetAsyncKeyState((int)vk);  // read-and-clear bit 0
+}
+
+static bool AnyNonModifierKeyPressedSince() {
+    for (DWORD vk : NON_MODIFIER_VKS)
+        if (GetAsyncKeyState((int)vk) & 0x0001) return true;
+    return false;
+}
+
+// ---------- Raw input buffer drain --------------------------------------------
+// Called synchronously from the LWin keyup LL hook callback, BEFORE deciding
+// whether to fire a pending modifier-only combo.
+//
+// Problem: LL hook callbacks are delivered as sent messages (high priority).
+// WM_INPUT is a posted message (lower priority). GetMessage processes sent
+// messages before posted ones, so the LWin keyup hook fires BEFORE WM_INPUT
+// for any AHK-swallowed key (e.g. Z, 1) is dispatched -- making had_other_key
+// still false at decision time.
+//
+// Fix: GetRawInputBuffer reads the raw input buffer directly, bypassing the
+// WM_INPUT dispatch queue. The buffer is populated at physical-key time (before
+// any hook fires), so it always contains Z's data when LWin keyup hook runs.
+static void DrainRawInput() {
+    UINT sz = 0;
+    UINT rc = GetRawInputBuffer(NULL, &sz, sizeof(RAWINPUTHEADER));
+    Logf("DrainRawInput: query rc=%u sz=%u", rc, sz);
+    if (rc != 0 || sz == 0) return;
+
+    std::vector<BYTE> buf(sz + sizeof(RAWINPUT)); // slack for 8-byte alignment
+    UINT bufsz = (UINT)buf.size();               // must pass actual capacity, not query-result sz
+    UINT cnt = GetRawInputBuffer((RAWINPUT*)buf.data(), &bufsz, sizeof(RAWINPUTHEADER));
+    Logf("DrainRawInput: read cnt=%u err=%lu", cnt, cnt == (UINT)-1 ? GetLastError() : 0UL);
+    if (cnt == (UINT)-1) {
+        // sz>0 means data is present but unreadable — cancel conservatively
+        Logf("DrainRawInput: read failed → cancel conservatively");
+        EnterCriticalSection(&g_cs);
+        CancelPendingCombos("raw buffer drain (read failed, data present)");
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
+    if (cnt == 0) return;
+
+    bool cancel = false;
+    RAWINPUT* ri = (RAWINPUT*)buf.data();
+    for (UINT i = 0; i < cnt; ++i) {
+        bool physical = (ri->header.hDevice != NULL);
+        if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+            bool isDown = !(ri->data.keyboard.Flags & RI_KEY_BREAK);
+            USHORT vk = ri->data.keyboard.VKey;
+            bool isMod = false;
+            for (DWORD mod : MODIFIER_VKS)
+                if (vk == (USHORT)mod) { isMod = true; break; }
+            Logf("DrainRawInput[%u]: kbd VK=0x%02X isDown=%d isMod=%d physical=%d",
+                 i, vk, isDown, isMod, physical);
+            // Cancel on both physical and injected non-modifier keydowns.
+            // Injected non-modifier keys (e.g. VK_CONTROL=0x11 injected by AHK's
+            // "Send ^v" action) signal that a hotkey fired while the modifier was held.
+            // WinKeyHook's own cleanup sends VK_LCONTROL (0xA2) which IS in MODIFIER_VKS
+            // (isMod=true), so it is never caught here.
+            if (isDown && !isMod) cancel = true;
+        } else if (ri->header.dwType == RIM_TYPEMOUSE) {
+            USHORT bf = ri->data.mouse.usButtonFlags;
+            if (bf != 0) Logf("DrainRawInput[%u]: mouse flags=0x%04X physical=%d", i, bf, physical);
+            if (physical && (bf & (RI_MOUSE_LEFT_BUTTON_DOWN  |
+                                   RI_MOUSE_RIGHT_BUTTON_DOWN  |
+                                   RI_MOUSE_MIDDLE_BUTTON_DOWN |
+                                   RI_MOUSE_BUTTON_4_DOWN      |
+                                   RI_MOUSE_BUTTON_5_DOWN)))
+                cancel = true;
+        }
+        // NEXTRAWINPUTBLOCK uses QWORD (unavailable with WIN32_LEAN_AND_MEAN);
+        // equivalent: advance by dwSize then 8-byte align.
+        ri = (RAWINPUT*)(((uintptr_t)((BYTE*)ri + ri->header.dwSize) + 7) & ~(uintptr_t)7);
+    }
+
+    Logf("DrainRawInput: cancel=%d", cancel);
+    if (cancel) {
+        EnterCriticalSection(&g_cs);
+        CancelPendingCombos("raw buffer drain (keyup sync)");
+        LeaveCriticalSection(&g_cs);
+    }
+}
+
+// ---------- Raw input window proc ---------------------------------------------
+// A message-only window receives WM_INPUT for every physical keyboard and mouse
+// event, independently of the LL hook chain. This means AHK swallowing a key
+// via its own hook (without calling CallNextHookEx) does NOT prevent us from
+// seeing the physical event here.
+//
+// hDevice == NULL in RAWINPUTHEADER identifies injected (synthetic) events,
+// e.g. from SendInput. We skip those so our own InjectModifierCleanup calls
+// and AHK's injected keystrokes do not falsely cancel a pending combo.
+//
+// Timing guarantee: WM_INPUT is posted to the message queue from the HID driver
+// before the keyboard event reaches the LL hook pipeline. Because both messages
+// go through the same FIFO queue on the main thread, WM_INPUT for key N is
+// always processed before the LL-hook callback for any key pressed after N.
+// Therefore, when the LWin keyup LL hook fires, all WM_INPUT messages for keys
+// pressed while LWin was held are already dispatched and had_other_key is set.
+static const wchar_t* MSG_WND_CLASS = L"WinKeyHookMsgWnd";
+
+static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INPUT) {
+        UINT sz = 0;
+        GetRawInputData((HRAWINPUT)lp, RID_INPUT, NULL, &sz, sizeof(RAWINPUTHEADER));
+        if (sz > 0 && sz <= 256) {
+            BYTE buf[256];
+            if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, buf, &sz,
+                                sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+                RAWINPUT* ri = (RAWINPUT*)buf;
+                bool physical = (ri->header.hDevice != NULL);
+                bool cancel = false;
+                if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+                    bool isDown = !(ri->data.keyboard.Flags & RI_KEY_BREAK);
+                    USHORT vk = ri->data.keyboard.VKey;
+                    bool isMod = false;
+                    for (DWORD mod : MODIFIER_VKS)
+                        if (vk == (USHORT)mod) { isMod = true; break; }
+                    Logf("WM_INPUT: kbd VK=0x%02X isDown=%d isMod=%d physical=%d",
+                         vk, isDown, isMod, physical);
+                    // Same rationale as DrainRawInput: cancel on injected non-modifier
+                    // keydowns too (AHK action indicator), not just physical ones.
+                    if (isDown && !isMod) cancel = true;
+                } else if (ri->header.dwType == RIM_TYPEMOUSE) {
+                    USHORT bf = ri->data.mouse.usButtonFlags;
+                    if (bf != 0) Logf("WM_INPUT: mouse flags=0x%04X physical=%d", bf, physical);
+                    if (physical && (bf & (RI_MOUSE_LEFT_BUTTON_DOWN  |
+                                          RI_MOUSE_RIGHT_BUTTON_DOWN  |
+                                          RI_MOUSE_MIDDLE_BUTTON_DOWN |
+                                          RI_MOUSE_BUTTON_4_DOWN      |
+                                          RI_MOUSE_BUTTON_5_DOWN)))
+                        cancel = true;
+                }
+                if (cancel) {
+                    EnterCriticalSection(&g_cs);
+                    CancelPendingCombos("WM_INPUT (physical key/mouse)");
+                    LeaveCriticalSection(&g_cs);
+                }
+            }
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------- Modifier cleanup helper -------------------------------------------
 // Called when a modifier-only combo fires on keyup (solo press).
 // We suppressed the physical keyup -- inject a Ctrl tap to "poison" the modifier
 // press (prevents Start Menu / Ctrl+Alt+Del prompt), then inject the modifier keyup
@@ -354,6 +522,24 @@ static void InjectModifierCleanup(DWORD modVk) {
     inputs[2].ki.dwFlags = KEYEVENTF_KEYUP |
                            ((modVk == VK_LWIN || modVk == VK_RWIN) ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(3, inputs, sizeof(INPUT));
+}
+
+// ---------- Start Menu taint helper -------------------------------------------
+// Injects a VK_NONAME (0xFF) tap while a Win key is physically held. VK_NONAME
+// is an unassigned virtual key -- no application responds to it, but the Windows
+// shell counts it as "another key pressed while Win held", suppressing the Start
+// Menu on Win release. Used when Win+mouse-click occurs: mouse clicks are invisible
+// to the shell's combo logic, so without this the Start Menu opens on Win release.
+// The injected events carry LLKHF_INJECTED -> LowLevelKeyboardProc ignores them.
+static void InjectStartMenuTaint() {
+    INPUT inputs[2] = {};
+    inputs[0].type       = INPUT_KEYBOARD;
+    inputs[0].ki.wVk     = VK_NONAME;       // 0xFF, documented unassigned VK
+    inputs[0].ki.dwFlags = 0;
+    inputs[1].type       = INPUT_KEYBOARD;
+    inputs[1].ki.wVk     = VK_NONAME;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, inputs, sizeof(INPUT));
 }
 
 // ---------- Watchdog thread ----------------------------------------------------
@@ -462,12 +648,26 @@ DWORD WINAPI ClientThread(LPVOID raw) {
     }
 
     Logf("CLIENT %u disconnected", cid);
+    bool should_quit = false;
     EnterCriticalSection(&g_cs);
     for (auto it = g_combos.begin(); it != g_combos.end(); )
         it = (it->owner_client_id == cid) ? g_combos.erase(it) : ++it;
     for (auto& c : g_clients)
         if (c.id == cid) { c.alive = false; break; }
+
+    // Auto-exit when last pipe client disconnects and no CLI combos are registered.
+    // Avoids the daemon staying alive forever after its only user (e.g. InputBar) exits.
+    bool has_live_client = false;
+    for (const auto& c : g_clients) if (c.alive) { has_live_client = true; break; }
+    bool has_cli_combo = false;
+    for (const auto& co : g_combos) if (co.cli_index >= 0) { has_cli_combo = true; break; }
+    if (!has_live_client && !has_cli_combo) should_quit = true;
     LeaveCriticalSection(&g_cs);
+
+    if (should_quit) {
+        Logf("CLIENT %u was last client, no CLI combos -- posting quit", cid);
+        PostThreadMessage(g_main_thread_id, WM_QUIT, 0, 0);
+    }
 
     CloseHandle(pipe);
     return 0;
@@ -536,13 +736,22 @@ void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event,
         EnterCriticalSection(&g_cs);
         for (auto& c : g_combos) { c.active = false; c.pending_trigger = false; c.had_other_key = false; }
         LeaveCriticalSection(&g_cs);
+        g_pending_foreground = NULL;
+        g_pending_fg_changed = false;
+    } else if (event == EVENT_SYSTEM_FOREGROUND) {
+        // Track any foreground switch while a modifier-only combo is pending.
+        // Win+1 twice (A→B→A) would fool a simple HWND equality check at keyup,
+        // but this flag catches both transitions.
+        if (g_pending_foreground != NULL)
+            g_pending_fg_changed = true;
     }
 }
 
 // ---------- Low-level mouse hook -----------------------------------------------
-// Cancels any pending modifier-only combo when the user clicks a mouse button.
-// The modifier was never suppressed (passes through on keydown), so AHK already
-// sees it held -- no injection needed; Win+MButton AHK shortcuts work natively.
+// Belt-and-suspenders: also cancels pending modifier-only combos on mouse button
+// down via the LL hook, in addition to the raw input path. Covers the common case
+// where our hook is first in the chain and fires before the WM_INPUT message is
+// dispatched, ensuring zero-latency cancellation.
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode != HC_ACTION)
         return CallNextHookEx(g_mouse_hook, nCode, wParam, lParam);
@@ -551,15 +760,26 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                          wParam == WM_MBUTTONDOWN  || wParam == WM_XBUTTONDOWN);
 
     if (isButtonDown) {
+        // g_pressed is hook-thread-local: LL keyboard and LL mouse hooks run on
+        // the same thread, so reading it here requires no lock.
+        bool win_held = g_pressed.count(VK_LWIN) || g_pressed.count(VK_RWIN);
+
+        bool taint_start_menu = false;
         EnterCriticalSection(&g_cs);
-        for (auto& combo : g_combos) {
-            if (combo.pending_trigger) {
-                combo.had_other_key   = true;
-                combo.pending_trigger = false;
-                combo.active          = false;
-            }
+        CancelPendingCombos("mouse hook (belt-and-suspenders)");
+        if (win_held) {
+            // Only taint when a Win combo is registered -- leaves Start Menu
+            // untouched for users who have no Win-key hotkeys.
+            for (const auto& c : g_combos)
+                if (c.hasVk(VK_LWIN) || c.hasVk(VK_RWIN)) { taint_start_menu = true; break; }
         }
         LeaveCriticalSection(&g_cs);
+
+        // SendInput outside g_cs -- keeps blocking calls out of the critical section.
+        if (taint_start_menu) {
+            Logf("MOUSE+WIN: injecting VK_NONAME taint to suppress Start Menu");
+            InjectStartMenuTaint();
+        }
     }
 
     return CallNextHookEx(g_mouse_hook, nCode, wParam, lParam);
@@ -590,10 +810,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             // Phase 1: cancel any pending modifier-only combo interrupted by a non-combo key.
             // The modifier was passed through on keydown (not suppressed), so no injection
             // is needed -- AHK already sees the modifier held, and the new key passes normally.
+            // Note: if AHK swallows the key without calling CallNextHookEx, this doesn't run --
+            // the raw input path (MsgWndProc / WM_INPUT) handles that case instead.
             {
                 EnterCriticalSection(&g_cs);
                 for (auto& combo : g_combos) {
                     if (combo.pending_trigger && !combo.hasVk(p->vkCode)) {
+                        Logf("PHASE1 CANCEL: '%s' interrupted by VK=0x%02X",
+                             combo.identifier().c_str(), p->vkCode);
                         combo.had_other_key   = true;
                         combo.pending_trigger = false;
                         combo.active          = false;
@@ -605,7 +829,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             // Phase 2: check for newly satisfied combos.
             // Only evaluate a combo when the pressed key belongs to it -- prevents
             // re-firing cancelled modifier-only combos when unrelated keys come in.
-            bool pending_modifier_set = false;
             std::vector<PendingWrite> pw;
             EnterCriticalSection(&g_cs);
             for (auto& combo : g_combos) {
@@ -622,7 +845,12 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                         // Fire on keyup instead (suppress keyup + inject cleanup there).
                         combo.pending_trigger = true;
                         combo.had_other_key   = false;
-                        pending_modifier_set   = true;
+                        Logf("PENDING SET: '%s' VK=0x%02X", combo.identifier().c_str(), p->vkCode);
+                        ClearInputHistory();  // zero driver-level bit-0 so keyup fallback only sees keys pressed after this moment
+                        if (g_pending_foreground == NULL) {
+                            g_pending_foreground = GetForegroundWindow();
+                            g_pending_fg_changed  = false;
+                        }
                         // suppress stays false -- key passes to Windows/AHK normally
                     } else {
                         combo.active = true;
@@ -634,9 +862,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             LeaveCriticalSection(&g_cs);
 
             FlushPendingWrites(pw);  // WriteFile outside CS
-
-            if (pending_modifier_set)
-                ClearInputHistory();
 
             if (suppress) {
                 g_suppressed.insert(p->vkCode);
@@ -651,9 +876,46 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (keyUp) {
         g_pressed.erase(p->vkCode);
 
-        // Fallback: detect keys/clicks AHK may have swallowed without calling CallNextHookEx.
-        // AnyNonModifierKeyPressedSince() consumes all history bits (no bleed into next window).
-        bool input_fallback = AnyNonModifierKeyPressedSince();
+        // Drain pending raw input synchronously before deciding to fire.
+        // Catches physical keys/clicks swallowed by AHK (not seen by our LL hook)
+        // whose WM_INPUT hasn't been dispatched yet due to sent-vs-posted priority.
+        {
+            bool hasPending = false;
+            EnterCriticalSection(&g_cs);
+            for (const auto& combo : g_combos)
+                if (combo.pending_trigger && combo.hasVk(p->vkCode)) { hasPending = true; break; }
+            LeaveCriticalSection(&g_cs);
+            Logf("KEYUP: VK=0x%02X hasPending=%d", p->vkCode, hasPending);
+            if (hasPending) DrainRawInput();
+            if (hasPending && g_pending_foreground != NULL) {
+                HWND cur_fg = GetForegroundWindow();
+                bool fg_changed = g_pending_fg_changed || (cur_fg != g_pending_foreground);
+                if (fg_changed) {
+                    Logf("FG CHANGED: event_flag=%d was=%p now=%p → cancel",
+                         g_pending_fg_changed, (void*)g_pending_foreground, (void*)cur_fg);
+                    EnterCriticalSection(&g_cs);
+                    CancelPendingCombos("foreground window changed (Win+shortcut)");
+                    LeaveCriticalSection(&g_cs);
+                }
+                g_pending_foreground = NULL;
+                g_pending_fg_changed = false;
+            }
+
+            // Final fallback: driver-level key history.  Catches Win+1–9 when
+            // the target app is already focused (no foreground change) and the
+            // second key was consumed by Windows Shell before reaching raw input
+            // or the LL hook chain.  GetAsyncKeyState bit 0 is set at the HID
+            // driver level — below Shell, below AHK.
+            if (hasPending) {
+                bool input_fallback = AnyNonModifierKeyPressedSince();
+                Logf("KEYUP FALLBACK: AnyNonModifierKeyPressedSince=%d", input_fallback);
+                if (input_fallback) {
+                    EnterCriticalSection(&g_cs);
+                    CancelPendingCombos("driver-level key history (Win+shortcut, app already focused)");
+                    LeaveCriticalSection(&g_cs);
+                }
+            }
+        }
 
         DWORD cleanup_vk = 0;
         std::vector<PendingWrite> pw;
@@ -662,17 +924,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (combo.pending_trigger && combo.hasVk(p->vkCode)) {
                 combo.pending_trigger = false;
                 combo.active          = false;
+                Logf("KEYUP DECISION: '%s' had_other_key=%d → %s",
+                     combo.identifier().c_str(), combo.had_other_key,
+                     combo.had_other_key ? "CANCEL" : "FIRE");
                 if (!combo.had_other_key) {
-                    if (input_fallback) {
-                        combo.had_other_key = true;
-                        Logf("CANCEL '%s': key/click detected via GetAsyncKeyState fallback",
-                             combo.identifier().c_str());
-                    } else {
-                        // Solo modifier press: suppress keyup to prevent Start Menu,
-                        // then inject cleanup sequence to release Windows modifier state.
-                        cleanup_vk = p->vkCode;
-                        FireCombo(combo, pw);
-                    }
+                    // Solo modifier press: suppress keyup to prevent Start Menu,
+                    // then inject cleanup sequence to release Windows modifier state.
+                    cleanup_vk = p->vkCode;
+                    FireCombo(combo, pw);
                 }
             }
             if (combo.active && !combo.satisfied(g_pressed))
@@ -788,13 +1047,135 @@ static void PrintTutorial() {
     );
 }
 
+// ---------- Update (--update) --------------------------------------------------
+static std::string GithubApiGet(const wchar_t* path) {
+    HINTERNET hSes = WinHttpOpen(L"WinKeyHook-Updater/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSes) return {};
+
+    HINTERNET hCon = WinHttpConnect(hSes, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hCon) { WinHttpCloseHandle(hSes); return {}; }
+
+    HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path, NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return {}; }
+
+    WinHttpAddRequestHeaders(hReq,
+        L"Accept: application/vnd.github+json\r\n"
+        L"X-GitHub-Api-Version: 2022-11-28\r\n",
+        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    std::string body;
+    if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+     && WinHttpReceiveResponse(hReq, NULL)) {
+        DWORD sz = 0;
+        while (WinHttpQueryDataAvailable(hReq, &sz) && sz > 0) {
+            std::vector<char> buf(sz + 1, 0);
+            DWORD rd = 0;
+            if (!WinHttpReadData(hReq, buf.data(), sz, &rd)) break;
+            body.append(buf.data(), rd);
+        }
+    }
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hCon);
+    WinHttpCloseHandle(hSes);
+    return body;
+}
+
+static std::string ExtractJsonField(const std::string& json, const std::string& key) {
+    for (const char* sep : {"\":\"", "\": \""}) {
+        std::string needle = "\"" + key + sep;
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) continue;
+        pos += needle.size();
+        auto end = json.find('"', pos);
+        if (end != std::string::npos) return json.substr(pos, end - pos);
+    }
+    return {};
+}
+
+static std::tuple<int,int,int> ParseSemVer(const std::string& v) {
+    const char* s = v.c_str();
+    if (*s == 'v' || *s == 'V') ++s;
+    int maj = 0, min_v = 0, pat = 0;
+    sscanf_s(s, "%d.%d.%d", &maj, &min_v, &pat);
+    return {maj, min_v, pat};
+}
+
+static int DoUpdate() {
+    std::cout << "Checking for updates..." << std::endl;
+
+    std::string json = GithubApiGet(L"/repos/BlessEphraem/WinKeyHook/releases/latest");
+    if (json.empty()) {
+        std::cerr << "ERR: Could not reach GitHub API\n";
+        return 1;
+    }
+
+    std::string tag = ExtractJsonField(json, "tag_name");
+    if (tag.empty()) {
+        std::cerr << "ERR: Could not parse release info\n";
+        return 1;
+    }
+
+    std::cout << "Installed : " << WINKEYHOOK_VERSION << "\n";
+    std::cout << "Latest    : " << tag << "\n";
+
+    if (ParseSemVer(tag) <= ParseSemVer(WINKEYHOOK_VERSION)) {
+        std::cout << "Already up to date.\n";
+        return 0;
+    }
+
+    // Build download URL: tag already contains 'v' prefix (e.g. "v1.0.4")
+    std::string url = "https://github.com/BlessEphraem/WinKeyHook/releases/download/"
+        + tag + "/WinKeyHook_" + tag + "_Setup.exe";
+
+    wchar_t tmpDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmpDir);
+    std::wstring destW = std::wstring(tmpDir) + L"WinKeyHook_update.exe";
+
+    std::cout << "Downloading " << tag << "..." << std::endl;
+
+    std::wstring urlW(url.begin(), url.end());  // URL is pure ASCII
+    HRESULT hr = URLDownloadToFileW(NULL, urlW.c_str(), destW.c_str(), 0, NULL);
+    if (FAILED(hr)) {
+        std::cerr << "ERR: Download failed (0x" << std::hex << hr << ")\n";
+        return 1;
+    }
+
+    std::cout << "Launching installer..." << std::endl;
+    HINSTANCE res = ShellExecuteW(NULL, L"runas", destW.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)res <= 32) {
+        std::cerr << "ERR: Could not launch installer (code " << (INT_PTR)res << ")\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 // ---------- Entry point --------------------------------------------------------
 int main(int argc, char* argv[]) {
+    // Hide the console window when running as a daemon (argc >= 2, not a query
+    // flag). Task Scheduler and ShellExecute don't pass CREATE_NO_WINDOW, so a
+    // console window would appear briefly. ShowWindow suppresses it immediately
+    // without affecting stdout (pipe handles used by parent processes are
+    // unaffected by hiding the console window).
+    if (argc >= 2) {
+        std::string firstArg = argv[1];
+        bool is_daemon = (firstArg != "--version" && firstArg != "--update");
+        if (is_daemon) {
+            HWND consoleWnd = GetConsoleWindow();
+            if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);
+        }
+    }
+
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "--version") {
-            std::cout << "v1.0.1" << std::endl;
+            std::cout << WINKEYHOOK_VERSION << std::endl;
             return 0;
+        }
+        if (arg == "--update") {
+            return DoUpdate();
         }
     }
     if (argc < 2) {
@@ -875,14 +1256,53 @@ int main(int argc, char* argv[]) {
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
     );
     if (!g_win_event_hook)
-        Log("WARNING: SetWinEventHook failed -- UAC/lock recovery disabled");
+        Log("WARNING: SetWinEventHook(DESKTOPSWITCH) failed -- UAC/lock recovery disabled");
+
+    g_fg_event_hook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+    );
+    if (!g_fg_event_hook)
+        Log("WARNING: SetWinEventHook(FOREGROUND) failed -- Win+number cancel may miss double-switch");
 
     g_hook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
     if (!g_hook) { std::cerr << "ERREUR_HOOK\n"; return 1; }
 
     g_mouse_hook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, NULL, 0);
     if (!g_mouse_hook)
-        Log("WARNING: WH_MOUSE_LL failed -- Win+MouseButton combos may not work");
+        Log("WARNING: WH_MOUSE_LL failed -- mouse-button combo cancellation may be delayed");
+
+    // -- Raw input: message-only window -----------------------------------------
+    // Receives physical keyboard + mouse events independently of the LL hook chain.
+    // Injected events (SendInput) have hDevice == NULL and are ignored in MsgWndProc.
+    {
+        WNDCLASSW wc    = {};
+        wc.lpfnWndProc  = MsgWndProc;
+        wc.hInstance    = GetModuleHandleW(NULL);
+        wc.lpszClassName = MSG_WND_CLASS;
+        if (RegisterClassW(&wc)) {
+            g_msg_wnd = CreateWindowExW(0, MSG_WND_CLASS, NULL, 0,
+                                         0, 0, 0, 0,
+                                         HWND_MESSAGE, NULL,
+                                         GetModuleHandleW(NULL), NULL);
+        }
+        if (g_msg_wnd) {
+            RAWINPUTDEVICE rids[2] = {};
+            rids[0].usUsagePage = 0x01; rids[0].usUsage = 0x06; // keyboard
+            rids[0].dwFlags     = RIDEV_INPUTSINK;
+            rids[0].hwndTarget  = g_msg_wnd;
+            rids[1].usUsagePage = 0x01; rids[1].usUsage = 0x02; // mouse
+            rids[1].dwFlags     = RIDEV_INPUTSINK;
+            rids[1].hwndTarget  = g_msg_wnd;
+            if (RegisterRawInputDevices(rids, 2, sizeof(RAWINPUTDEVICE)))
+                Log("Raw input registered.");
+            else
+                Log("WARNING: RegisterRawInputDevices failed -- modifier-combo cancellation may miss swallowed keys");
+        } else {
+            Log("WARNING: message window creation failed -- raw input unavailable");
+        }
+    }
 
     Log("Hooks installed.");
     std::cout << "HOOK_STARTED" << std::endl;
@@ -899,6 +1319,11 @@ int main(int argc, char* argv[]) {
     UnhookWindowsHookEx(g_hook);
     if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
     if (g_win_event_hook) UnhookWinEvent(g_win_event_hook);
+    if (g_fg_event_hook)  UnhookWinEvent(g_fg_event_hook);
+    if (g_msg_wnd) {
+        DestroyWindow(g_msg_wnd);
+        UnregisterClassW(MSG_WND_CLASS, GetModuleHandleW(NULL));
+    }
     DeleteCriticalSection(&g_cs);
     if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
     Log("=== WinKeyHook stopped ===");
